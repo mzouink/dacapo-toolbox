@@ -132,9 +132,9 @@ def gif_2d(
         return
     transformed_arrays = {}
     for key, arr in arrays.items():
-        assert arr.voxel_size.dims == 3, (
-            f"Array {key} must be 3D, got {arr.voxel_size.dims}D"
-        )
+        assert (
+            arr.voxel_size.dims == 3
+        ), f"Array {key} must be 3D, got {arr.voxel_size.dims}D"
         if array_types[key] == "pca":
             transformed_arrays[key] = pca_nd(arr)
         else:
@@ -143,11 +143,15 @@ def gif_2d(
 
     z_arr_slices = [arr.roi.shape[0] // arr.voxel_size[0] for arr in arrays.values()]
     z_slices = min(z_arr_slices)
-    assert z_slices == max(z_arr_slices), (
-        f"All arrays must have the same number of z slices, got {z_arr_slices}"
-    )
+    assert z_slices == max(
+        z_arr_slices
+    ), f"All arrays must have the same number of z slices, got {z_arr_slices}"
 
     fig, axes = plt.subplots(1, len(arrays), figsize=(2 + 3 * len(arrays), 4), dpi=dpi)
+
+    # Handle the case where there's only one subplot
+    if len(arrays) == 1:
+        axes = [axes]
 
     label_cmap = get_cmap()
 
@@ -217,7 +221,7 @@ def gif_2d(
         writer = PillowWriter(fps=fps, metadata=dict(artist="dacapo"), bitrate=1800)
 
     ani.save(filename, writer=writer, dpi=dpi)
-    plt.close()
+    plt.close(fig)
 
 
 def cube(
@@ -292,9 +296,9 @@ def cube(
     ) -> dict[str, tuple[list[np.ndarray], list[np.ndarray]]]:
         faces = {}
         for name, arr in arrays.items():
-            assert arr.voxel_size.dims == 3, (
-                f"Array {name} must be 3D, got {arr.voxel_size.dims}D"
-            )
+            assert (
+                arr.voxel_size.dims == 3
+            ), f"Array {name} must be 3D, got {arr.voxel_size.dims}D"
             lower = arr.roi.offset
             upper = lower + arr.roi.shape - arr.voxel_size
             shape = arr.roi.shape
@@ -367,6 +371,10 @@ def cube(
         subplot_kw={"projection": "3d"},
     )
 
+    # Handle the case where there's only one subplot
+    if len(arrays) == 1:
+        axes = [axes]
+
     label_cmap = get_cmap()
 
     def draw_cube(
@@ -416,7 +424,7 @@ def cube(
         ax.axis("off")
 
     for jj, (key, face_data) in enumerate(faces.items()):
-        ax = axes[jj] if len(arrays) > 1 else axes
+        ax = axes[jj]
         face_colors = face_data[0]
 
         if array_types[key] == "labels":
