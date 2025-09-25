@@ -17,7 +17,7 @@ import time
 import functools
 from dataclasses import dataclass
 from .tmp import gcd
-from typing import Callable
+from typing import Callable, Any, Union
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,52 @@ def gp_to_nx_graph(
     return g
 
 
+def create_monai_adapter(
+    monai_transforms: Callable,
+) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    """
+    Create an adapter function that makes MONAI transforms compatible with dacapo's batch format.
+
+    This adapter handles the conversion between dacapo's batch format (with metadata) and
+    MONAI's expected format.
+
+    Args:
+        monai_transforms: A MONAI transform or Compose object
+
+    Returns:
+        A function that can be used as the transforms parameter in iterable_dataset
+
+    Example:
+        from monai.transforms import Compose, ScaleIntensityRanged, RandSpatialCropd
+
+        monai_transforms = Compose([
+            ScaleIntensityRanged(keys=["raw"], a_min=0, a_max=255, b_min=0.0, b_max=1.0),
+            RandSpatialCropd(keys=["raw"], roi_size=(64, 64, 64))
+        ])
+
+        dataset = iterable_dataset(
+            datasets={"raw": my_array},
+            shapes={"raw": (128, 128, 128)},
+            transforms=create_monai_adapter(monai_transforms)
+        )
+    """
+
+    def adapter_func(batch: dict[str, Any]) -> dict[str, Any]:
+        # Extract metadata before applying MONAI transforms
+        metadata = batch.pop("metadata", None)
+
+        # Apply MONAI transforms
+        transformed_batch = monai_transforms(batch)
+
+        # Restore metadata
+        if metadata is not None:
+            transformed_batch["metadata"] = metadata
+
+        return transformed_batch
+
+    return adapter_func
+
+
 class PipelineDataset(torch.utils.data.IterableDataset):
     """
     A torch dataset that wraps a gunpowder pipeline and provides batches of data.
@@ -73,10 +119,11 @@ class PipelineDataset(torch.utils.data.IterableDataset):
         pipeline: gp.Pipeline,
         request: gp.BatchRequest,
         keys: list[gp.ArrayKey],
-        transforms: dict[
-            str | tuple[str | tuple[str, ...], str | tuple[str, ...]], Callable
-        ]
-        | None = None,
+        transforms: Union[
+            dict[str | tuple[str | tuple[str, ...], str | tuple[str, ...]], Callable],
+            Callable[[dict[str, Any]], dict[str, Any]],
+            None,
+        ] = None,
     ):
         self.pipeline = pipeline
         self.request = request
@@ -91,13 +138,15 @@ class PipelineDataset(torch.utils.data.IterableDataset):
             batch = self.pipeline.request_batch(batch_request)
             # TODO: Throw warning on incorrect byteorder!
             torch_batch = {
-                str(key): torch.from_numpy(
-                    batch[key]
-                    .data.astype(batch[key].data.dtype.newbyteorder("="))
-                    .copy()
+                str(key): (
+                    torch.from_numpy(
+                        batch[key]
+                        .data.astype(batch[key].data.dtype.newbyteorder("="))
+                        .copy()
+                    )
+                    if isinstance(key, gp.ArrayKey)
+                    else gp_to_nx_graph(batch[key])
                 )
-                if isinstance(key, gp.ArrayKey)
-                else gp_to_nx_graph(batch[key])
                 for key in self.keys
             }
             torch_batch["metadata"] = {
@@ -107,32 +156,50 @@ class PipelineDataset(torch.utils.data.IterableDataset):
             }
 
             if self.transforms is not None:
-                for transform_signature, transform_func in self.transforms.items():
-                    if isinstance(transform_signature, tuple):
-                        in_key, out_key = transform_signature
-                    else:
-                        in_key, out_key = transform_signature, transform_signature
+                if isinstance(self.transforms, dict):
+                    # Original dacapo-style transforms
+                    for transform_signature, transform_func in self.transforms.items():
+                        if isinstance(transform_signature, tuple):
+                            in_key, out_key = transform_signature
+                        else:
+                            in_key, out_key = transform_signature, transform_signature
 
-                    if isinstance(in_key, str):
-                        in_keys = [in_key]
-                    elif isinstance(in_key, tuple):
-                        in_keys = list(in_key)
+                        if isinstance(in_key, str):
+                            in_keys = [in_key]
+                        elif isinstance(in_key, tuple):
+                            in_keys = list(in_key)
 
-                    for in_key in in_keys:
-                        assert in_key in torch_batch, (
-                            f"Can only process keys that are in the batch. Please ensure that {in_key} "
-                            f"is either provided as a dataset or created as the result of a transform "
-                            f"of the form ({{in_key}}, {in_key})) *before* the transform ({in_key})."
-                        )
-                    in_tensors = [torch_batch[in_key] for in_key in in_keys]
-                    out_tensor = transform_func(*in_tensors)
-                    if isinstance(out_key, str):
-                        torch_batch[out_key] = out_tensor
-                    else:
-                        out_keys = out_key
-                        out_tensors = out_tensor
-                        for out_key, out_tensor in zip(out_keys, out_tensors):
+                        for in_key in in_keys:
+                            assert in_key in torch_batch, (
+                                f"Can only process keys that are in the batch. Please ensure that {in_key} "
+                                f"is either provided as a dataset or created as the result of a transform "
+                                f"of the form ({{in_key}}, {in_key})) *before* the transform ({in_key})."
+                            )
+                        in_tensors = [torch_batch[in_key] for in_key in in_keys]
+                        out_tensor = transform_func(*in_tensors)
+                        if isinstance(out_key, str):
                             torch_batch[out_key] = out_tensor
+                        else:
+                            out_keys = out_key
+                            out_tensors = out_tensor
+                            for out_key, out_tensor in zip(out_keys, out_tensors):
+                                torch_batch[out_key] = out_tensor
+                elif callable(self.transforms):
+                    # MONAI-style transforms that accept and return dictionaries
+                    # Remove metadata temporarily since MONAI transforms don't expect it
+                    metadata = torch_batch.pop("metadata", None)
+
+                    # Apply the transform
+                    torch_batch = self.transforms(torch_batch)
+
+                    # Restore metadata if it existed
+                    if metadata is not None:
+                        torch_batch["metadata"] = metadata
+                else:
+                    raise ValueError(
+                        f"Transforms must be either a dictionary (dacapo-style) or a callable (MONAI-style), "
+                        f"got {type(self.transforms)}"
+                    )
 
             t2 = time.time()
             logger.debug(f"Batch generated in {t2 - t1:.4f} seconds")
@@ -226,14 +293,14 @@ def iterable_dataset(
     datasets: dict[str, Array | nx.Graph | Sequence[Array] | Sequence[nx.Graph]],
     shapes: dict[str, Sequence[int]],
     weights: Sequence[float] | None = None,
-    transforms: dict[
-        str | tuple[str | tuple[str, ...], str | tuple[str, ...]], Callable
-    ]
-    | None = None,
-    sampling_strategies: MaskedSampling
-    | PointSampling
-    | Sequence[MaskedSampling | PointSampling]
-    | None = None,
+    transforms: Union[
+        dict[str | tuple[str | tuple[str, ...], str | tuple[str, ...]], Callable],
+        Callable[[dict[str, Any]], dict[str, Any]],
+        None,
+    ] = None,
+    sampling_strategies: (
+        MaskedSampling | PointSampling | Sequence[MaskedSampling | PointSampling] | None
+    ) = None,
     trim: int | Sequence[int] | None = None,
     simple_augment_config: SimpleAugmentConfig | None = None,
     deform_augment_config: DeformAugmentConfig | None = None,
@@ -242,6 +309,44 @@ def iterable_dataset(
     """
     Builds a gunpowder pipeline and wraps it in a torch IterableDataset.
     See https://pytorch.org/docs/stable/data.html#torch.utils.data.IterableDataset for more info
+
+    Args:
+        datasets: Dictionary mapping dataset names to Arrays, Graphs, or sequences thereof
+        shapes: Dictionary mapping dataset names to their expected output shapes
+        weights: Optional weights for random sampling between datasets
+        transforms: Either:
+            - A dictionary mapping transform signatures to callable functions (dacapo-style)
+            - A single callable that accepts and returns a dictionary (MONAI-style)
+            - None for no transforms
+        sampling_strategies: Sampling strategies for each dataset
+        trim: Number of voxels to trim from dataset boundaries
+        simple_augment_config: Configuration for simple geometric augmentations
+        deform_augment_config: Configuration for deformation-based augmentations
+        interpolatable: Dictionary specifying which datasets can be interpolated
+
+    Examples:
+        # Using MONAI transforms:
+        from monai.transforms import Compose, ScaleIntensityRanged
+
+        monai_transforms = Compose([
+            ScaleIntensityRanged(keys=["raw"], a_min=0, a_max=255, b_min=0.0, b_max=1.0)
+        ])
+
+        dataset = iterable_dataset(
+            datasets={"raw": my_array},
+            shapes={"raw": (128, 128, 128)},
+            transforms=monai_transforms
+        )
+
+        # Using dacapo-style transforms:
+        dataset = iterable_dataset(
+            datasets={"raw": my_array, "gt": my_gt},
+            shapes={"raw": (128, 128, 128), "gt": (64, 64, 64)},
+            transforms={
+                ("raw", "processed_raw"): lambda x: x * 2,
+                "gt": lambda x: x.float()
+            }
+        )
     """
 
     # Check the validity of the inputs
@@ -342,9 +447,11 @@ def iterable_dataset(
             crop_roi = crop_roi.grow(-trim * crop_voxel_size, -trim * crop_voxel_size)
 
         crop_graphs = [
-            nx_to_gp_graph(graph, crop_scale)
-            if graph is not None
-            else nx_to_gp_graph(nx.Graph(), crop_scale)
+            (
+                nx_to_gp_graph(graph, crop_scale)
+                if graph is not None
+                else nx_to_gp_graph(nx.Graph(), crop_scale)
+            )
             for graph in crop_datasets
             if isinstance(graph, nx.Graph) or graph is None
         ]
@@ -366,12 +473,14 @@ def iterable_dataset(
             )
             + gp.Pad(
                 key,
-                None
-                if not (
-                    isinstance(sampling_strategy, MaskedSampling)
-                    and sampling_strategy.mask_key == str(key)
-                )
-                else Coordinate((0,) * len(crop_scale)),
+                (
+                    None
+                    if not (
+                        isinstance(sampling_strategy, MaskedSampling)
+                        and sampling_strategy.mask_key == str(key)
+                    )
+                    else Coordinate((0,) * len(crop_scale))
+                ),
             )
             for key, array in zip(array_keys, crop_arrays)
         ) + tuple(
@@ -458,17 +567,17 @@ def iterable_dataset(
     for key in array_keys:
         crop_scale = crops_scale[0]
         data_shape = shapes.get(str(key), None)
-        assert data_shape is not None, (
-            f"Shape for key {key} not provided. Please provide a shape for all keys."
-        )
+        assert (
+            data_shape is not None
+        ), f"Shape for key {key} not provided. Please provide a shape for all keys."
         request.add(
             key, Coordinate(data_shape) * datasets[str(key)][0].voxel_size / crop_scale
         )
     for key in graph_keys:
         data_shape = shapes.get(str(key), None)
-        assert data_shape is not None, (
-            f"Shape for key {key} not provided. Please provide a shape for all keys."
-        )
+        assert (
+            data_shape is not None
+        ), f"Shape for key {key} not provided. Please provide a shape for all keys."
         request.add(key, Coordinate(data_shape))
 
     # Add mask placeholder to guarantee center voxel is contained in
